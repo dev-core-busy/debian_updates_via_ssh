@@ -1,0 +1,23 @@
+# Zielsysteme fuer den GUI-Test (Debian 12 vom Mai 2024 -> echte Updates und Dist-Upgrade).
+#   VARIANTE=sudo : Benutzer 'verwalter' mit sudo MIT Passwort
+#   VARIANTE=su   : kein sudo installiert, root nur ueber su, AllowTcpForwarding no
+# Die Passwoerter sind reine Testwerte fuer diese Wegwerf-Container.
+ARG DEBIAN_TAG=bookworm-20240513
+FROM debian:${DEBIAN_TAG}
+ARG VARIANTE=sudo
+ARG VERWALTER_PW=Test-Verwalter-4711
+ARG ROOT_PW=Test-Root-4711
+RUN apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends openssh-server \
+      $( [ "$VARIANTE" = sudo ] && echo sudo ) \
+ && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*.deb \
+ && mkdir -p /run/sshd \
+ && useradd -m -s /bin/bash verwalter \
+ && echo "verwalter:${VERWALTER_PW}" | chpasswd \
+ && echo "root:${ROOT_PW}" | chpasswd \
+ && if [ "$VARIANTE" = sudo ]; then usermod -aG sudo verwalter; \
+    else printf '\nAllowTcpForwarding no\n' >> /etc/ssh/sshd_config; fi \
+ # Im Container ist sshd PID 1: Paket-Updates duerfen ihn nicht neu starten
+ && printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d && chmod +x /usr/sbin/policy-rc.d
+EXPOSE 22
+CMD ["/usr/sbin/sshd", "-D", "-e"]

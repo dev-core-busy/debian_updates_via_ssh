@@ -339,10 +339,19 @@ case "$SUDO_MODUS" in
     nein) SUDO="" ;;
     auto) [ "$ZIEL_BENUTZER" = "root" ] || SUDO="sudo -n " ;;
 esac
+# Helfer-Modus: Wartungsbenutzer (von der Oberflaeche eingerichtet) darf per
+# sudo nur /usr/local/sbin/apt-via-ssh-helper ausfuehren.
+HELFER=/usr/local/sbin/apt-via-ssh-helper
+HELFER_MODUS=0
 if [ -n "$SUDO" ]; then
-    ssh_aus 'sudo -n true' >/dev/null 2>&1 \
-        || fehler "sudo ohne Passwort ist fuer $ZIEL_BENUTZER nicht moeglich (NOPASSWD noetig) -- oder als root verbinden"
-    laut "Verwende sudo"
+    if ssh_aus 'sudo -n true' >/dev/null 2>&1; then
+        laut "Verwende sudo"
+    elif ssh_aus "sudo -n $HELFER version" >/dev/null 2>&1; then
+        HELFER_MODUS=1
+        info "Wartungsbenutzer erkannt: Paketverwaltung ueber $HELFER"
+    else
+        fehler "sudo ohne Passwort ist fuer $ZIEL_BENUTZER nicht moeglich (NOPASSWD noetig) -- oder als root verbinden"
+    fi
 fi
 
 # Erreichbarkeit des Proxys vom Ziel aus pruefen (vier Varianten, je nach
@@ -415,6 +424,45 @@ fuehr_aus() {   # fuehrt eine Befehlszeile auf dem Ziel aus
 
 APT="${SUDO}env${UMGEBUNG} apt-get${APT_OPT_STR}"   # fuer update
 APT_OP="${APT}${OP_OPT}"                              # fuer die Operation
+
+# ----------------------------------------------------------- Helfer-Modus
+if [ "$HELFER_MODUS" -eq 1 ]; then
+    helfer() { local z="sudo -n $HELFER"; local a; for a in "$@"; do z+=" $(sq "$a")"; done; laut "remote: $z"; ssh_aus "$z"; }
+    zeige_sim() {   # TSV des Helfers lesbar ausgeben
+        awk -F'\t' '$1=="U"{printf "  aktualisieren  %-30s %s -> %s\n",$2,$3,$4}
+                    $1=="N"{printf "  NEU            %-30s %s\n",$2,$4}
+                    $1=="R"{printf "  ENTFERNEN      %-30s %s\n",$2,$3}
+                    $1=="S"{print "  " $2} $1=="F"{print "  " $2}
+                    $1=="G"{printf "  Download: %.1f MiB\n",$2/1048576}'
+    }
+    PAKETE=("${BEFEHL_ARGS[@]:-}")
+    case "$BEFEHL" in
+        selftest|update) helfer update "$PROXY_URL" ;;
+        check)
+            helfer update "$PROXY_URL" >/dev/null || fehler "apt-get update fehlgeschlagen"
+            info "Anstehende Updates:"
+            helfer aktualisierbar | zeige_sim ;;
+        upgrade|full-upgrade|dist-upgrade|install|download)
+            MODUS="$BEFEHL"; [ "$MODUS" = dist-upgrade ] && MODUS=full-upgrade
+            [ "$MODUS" = download ] && MODUS=install
+            declare -a M=("$MODUS"); [ "$MODUS" = install ] && M+=("${PAKETE[@]}")
+            helfer update "$PROXY_URL" >/dev/null || fehler "apt-get update fehlgeschlagen"
+            info "Vorschau:"
+            helfer simulieren "${M[@]}" | zeige_sim
+            if [ "$TROCKEN" -eq 1 ]; then gruen "Nur simuliert."; exit 0; fi
+            if [ "$JA" -eq 0 ]; then
+                [ -t 0 ] || fehler "Ohne Terminal bitte -y angeben"
+                read -r -p "Fortfahren? [j/N] " antwort
+                case "$antwort" in j|J|y|Y|ja|Ja) ;; *) info "Abgebrochen."; exit 1 ;; esac
+            fi
+            if [ "$BEFEHL" = download ] || [ "$NUR_LADEN" -eq 1 ]; then helfer laden "$PROXY_URL" "${M[@]}"
+            else helfer anwenden "$PROXY_URL" "${M[@]}"; fi ;;
+        run|tunnel)
+            fehler "'$BEFEHL' ist fuer den Wartungsbenutzer gesperrt (sudo nur fuer die Paketverwaltung)" ;;
+    esac
+    gruen "Fertig."
+    exit 0
+fi
 
 case "$BEFEHL" in
     selftest)

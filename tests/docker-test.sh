@@ -111,7 +111,8 @@ docker exec "$B" sh -c 'ls -d /var/lib/apt/lists.vor-apt-offline-sync >/dev/null
 
 abschnitt "Gateway"
 ls -d /tmp/apt-via-ssh.* /tmp/apt-offline-sync.* 2>/dev/null | grep -q . && schlecht "Arbeitsverzeichnisse uebrig" || gut "keine Arbeitsverzeichnisse uebrig"
-pgrep -f "python3 .*apt_proxy.py" >/dev/null && schlecht "Proxy laeuft noch" || gut "kein Proxy-Prozess uebrig"
+# nur den eigenen Proxy suchen (erkennbar am Cache-Pfad dieses Laufs), nicht fremde
+ps -eo args | grep -F "apt_proxy.py" | grep -F "$TMP/cache" | grep -vq grep && schlecht "Proxy laeuft noch" || gut "kein Proxy-Prozess uebrig"
 
 printf '\nErgebnis: %d OK, %d fehlgeschlagen\n' "$ok" "$fehl"
 [ "$fehl" -eq 0 ]

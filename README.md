@@ -24,14 +24,73 @@ Proxy wieder weg.
 
 | Datei | Zweck |
 |---|---|
-| `bin/apt-via-ssh` | **Hauptwerkzeug**: Proxy starten, Reverse-Tunnel aufbauen, apt auf dem Ziel ausführen, aufräumen |
+| `bin/apt-via-ssh-gui` | **Oberfläche im Browser**: Ziel anmelden, Voraussetzungen einrichten, Updates mit Vorschau, Distributions-Upgrade |
+| `bin/apt-via-ssh` | **Kommandozeile**: Proxy starten, Reverse-Tunnel aufbauen, apt auf dem Ziel ausführen, aufräumen |
 | `gateway/apt_proxy.py` | HTTP-Proxy (nur Python-Standardbibliothek): Host-Whitelist, CONNECT für https, Cache für `.deb`-Dateien |
 | `bin/apt-offline-sync` | **Fallback**, falls das Ziel keine Port-Weiterleitung erlaubt (`AllowTcpForwarding no`) |
+| `ziel/apt-via-ssh-helper` | Hilfsskript auf dem Ziel: die einzige Datei, die der Wartungsbenutzer per sudo ausführen darf |
+| `ziel/einrichten.sh`, `ziel/entfernen.sh` | richten den Wartungszugang auf dem Ziel ein bzw. entfernen ihn wieder |
 | `etc/apt-via-ssh.conf.example` | Beispielkonfiguration |
 | `tests/rauchtest.sh` | Rauchtest, der das Ziel nicht verändert |
 | `tests/docker-test.sh` | Integrationstest gegen echte, abgeschottete Debian-Container |
 
-## Schnellstart
+## Oberfläche
+
+```bash
+bin/apt-via-ssh-gui
+```
+
+Das Skript startet einen kleinen Webserver **nur auf 127.0.0.1** und öffnet den Browser.
+Er braucht nur die Python-Standardbibliothek, keine Installation.
+
+1. **Ziel und Anmeldung**: IP oder Hostname, Port, Benutzer, Passwort und/oder
+   SSH-Schlüssel (mit Passphrase), optional ein SSH-Zertifikat. Fehlen dem
+   Benutzer sudo-Rechte, kann zusätzlich das root-Passwort für `su` angegeben
+   werden. Beim ersten Kontakt zeigt die Oberfläche die Fingerabdrücke des
+   Hostschlüssels zur Bestätigung an. Ein *geänderter* Hostschlüssel wird
+   deutlich als Warnung gezeigt.
+2. **Voraussetzungen**: prüft Rechte, Tunnel, Speicherplatz, sudo und sshd und
+   richtet mit einem Klick den **Wartungsbenutzer** ein (Vorgabe `aptpflege`):
+   - eigener SSH-Schlüssel, kein Passwort; der Schlüssel ist mit `restrict`
+     eingeschränkt (kein Terminal, Tunnel nur auf localhost)
+   - `sudo` **nur** für `/usr/local/sbin/apt-via-ssh-helper`
+   - sshd-Regel nur für diesen Benutzer: ausschließlich Reverse-Tunnel, keine
+     Weiterleitung ins Netz des Ziels (schaltet den Tunnel frei, wenn
+     `AllowTcpForwarding` global gesperrt ist)
+   - fehlt `sudo`, wird es über den Tunnel installiert, notfalls in einem
+     zweiten Durchgang über den Tunnel des neuen Wartungsbenutzers
+
+   Danach verbindet man sich als Wartungsbenutzer, ohne Passwort.
+3. **Updates**: Paketlisten holen, verfügbare Updates mit Sicherheits-Kennzeichnung
+   anzeigen, einzeln oder alle auswählen. **Vor jeder Installation** zeigt eine
+   Vorschau genau, was aktualisiert, neu installiert und **entfernt** wird. Erst
+   nach „OK“ geht es los. Außerdem: Pakete installieren, `autoremove`.
+4. **Installiert**: alle installierten Pakete mit Filter.
+5. **Distributions-Upgrade** (z. B. 12 „bookworm“ → 13 „trixie“):
+   - Vorab-Prüfung (dpkg-Zustand, Platz, offene Updates, gehaltene Pakete)
+   - **Simulation** gegen die Paketlisten des neuen Release in einem
+     Testverzeichnis. Am System ändert sich dabei nichts.
+   - Start nur mit Bestätigung. Die Quellen werden gesichert, scheitert der
+     Download, werden sie automatisch zurückgesetzt.
+   - danach Neustart per Knopf
+
+**Abgekoppelte Installation:** Pakete werden zuerst über den Tunnel geladen,
+danach installiert `dpkg` auf dem Ziel in einer eigenen Sitzung (`setsid`). Reißt
+die SSH-Verbindung ab, läuft die Installation weiter. Nach dem Neuverbinden lässt
+sie sich mit „verfolgen“ wieder aufnehmen.
+
+Gespeichert werden in `~/.config/apt-via-ssh/` die Ziele (ohne Passwörter), die
+known_hosts der Oberfläche und die Wartungsschlüssel. Passwörter bleiben nur im
+Arbeitsspeicher. An `ssh` gelangen sie über `SSH_ASKPASS`: eine Datei mit Modus 0600, die
+sofort nach der Anmeldung gelöscht wird.
+
+Der Wartungsbenutzer funktioniert auch mit der Kommandozeile, z. B. per Cron:
+
+```bash
+bin/apt-via-ssh -y -i ~/.config/apt-via-ssh/schluessel/10.0.0.5_22_aptpflege_ed25519 aptpflege@10.0.0.5 upgrade
+```
+
+## Schnellstart (Kommandozeile)
 
 ```bash
 # 1. Verbindung und Tunnel prüfen (lädt nur Paketlisten)
@@ -125,6 +184,17 @@ Die bisherigen Paketlisten des Ziels werden nach
 
 ## Sicherheit
 
+Der Wartungsbenutzer erhält bewusst kein `sudo` für `apt-get` selbst, denn über
+`apt-get -o APT::Update::Pre-Invoke::=…` ließe sich jeder Befehl als root
+ausführen. Das Hilfsskript bietet stattdessen feste Befehle an, prüft Proxy-Adresse
+und Paketnamen und kann Paketquellen nur für das Distributions-Upgrade umstellen
+(Codename alt → neu). Neue Quellen oder Schlüssel kann es nicht hinzufügen. apt
+prüft weiterhin alle Signaturen.
+
+Die Oberfläche selbst lauscht nur auf 127.0.0.1. Sie prüft den Host-Header (gegen
+DNS-Rebinding) und verlangt ein zufälliges Sitzungs-Token im Cookie **und** im
+Header (gegen CSRF). Fremde Skripte lädt sie nicht (Content-Security-Policy).
+
 - Der Proxy lauscht nur auf `127.0.0.1` des Gateways. Der Reverse-Tunnel endet
   auf dem Ziel ebenfalls auf `127.0.0.1` (sshd-Vorgabe `GatewayPorts no`), und
   zwar nur, solange das Skript läuft.
@@ -152,6 +222,9 @@ Die bisherigen Paketlisten des Ziels werden nach
 | `sudo ohne Passwort ist … nicht möglich` | als root verbinden oder `NOPASSWD` für apt-get einrichten |
 | `403 Forbidden` / `Invalid response from proxy` | Host nicht in der Whitelist → `--allow HOST` |
 | `Proxy ist vom Zielsystem aus nicht erreichbar` | mit `-v --proxy-debug` wiederholen |
+| Oberfläche: „Hilfsskript … Version 1 statt 2“ | mit dem Erstzugang verbinden und „Einrichten“ erneut ausführen; das aktualisiert nur, was fehlt |
+| nach einem Upgrade auf Debian 13: neue SSH-Verbindungen scheitern, sshd meldet `-R not supported here` | der alte sshd läuft noch und startet das neue OpenSSH 10. Normalerweise startet das Paket sshd selbst neu; sonst auf dem Ziel `systemctl restart ssh`. Bestehende Verbindungen sind nicht betroffen |
+| Oberfläche meldet Verbindungsabbruch während einer Installation | die Installation läuft auf dem Ziel weiter: neu verbinden und in der Systemzeile „verfolgen“ klicken |
 
 ## Tests
 
@@ -180,3 +253,16 @@ DEBIAN_TAG=trixie tests/docker-test.sh  # Ziel: aktuelles Debian 13
 ```
 
 Container und Netz werden danach entfernt, das Image bleibt für Wiederholungen.
+
+End-to-End-Test der Oberfläche über ihre API. Dafür laufen zwei abgeschottete Ziele:
+eines mit sudo *mit* Passwort, eines ohne sudo, mit gesperrter Weiterleitung und
+root nur über su. Getestet werden Einrichtung, Updates, Vorschau, ein
+Verbindungsabbruch mitten in der Installation, der CLI-Helfer-Modus, das Entfernen
+und ein **echtes Distributions-Upgrade 12 → 13**:
+
+```bash
+python3 tests/gui-test.py              # ca. 5–10 Minuten
+```
+```bash
+python3 tests/gui-test.py --ohne-dist  # schneller, ohne Distributions-Upgrade
+```

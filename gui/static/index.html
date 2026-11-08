@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="token" content="%%TOKEN%%">
+<title>apt-via-ssh</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header class="kopfleiste">
+  <div class="marke"><span class="logo">⇄</span> apt-via-ssh</div>
+  <div id="status" class="status aus">nicht verbunden</div>
+  <button id="btn-trennen" class="leise" hidden>Trennen</button>
+</header>
+
+<main>
+  <!-- ======================================================= Ziel -->
+  <section id="karte-ziel" class="karte">
+    <h2>Ziel und Anmeldung</h2>
+    <form id="form-ziel" autocomplete="off">
+      <div class="raster">
+        <label class="breit">Gespeichertes Ziel
+          <select id="f-profil"><option value="">– neues Ziel –</option></select>
+        </label>
+        <label>Zieladresse (IP oder Hostname)
+          <input id="f-host" required placeholder="10.0.0.5" spellcheck="false">
+        </label>
+        <label class="schmal">SSH-Port
+          <input id="f-port" type="number" min="1" max="65535" value="22">
+        </label>
+        <label>Benutzer (Erstzugang)
+          <input id="f-benutzer" value="root" spellcheck="false">
+        </label>
+        <label>Passwort
+          <input id="f-passwort" type="password" autocomplete="new-password">
+        </label>
+        <label>SSH-Schlüssel (optional)
+          <input id="f-schluessel" list="liste-schluessel" placeholder="~/.ssh/id_ed25519" spellcheck="false">
+          <datalist id="liste-schluessel"></datalist>
+        </label>
+        <label>Passphrase des Schlüssels
+          <input id="f-passphrase" type="password" autocomplete="new-password">
+        </label>
+        <label>SSH-Zertifikat (optional)
+          <input id="f-zertifikat" list="liste-zertifikate" placeholder="~/.ssh/id_ed25519-cert.pub" spellcheck="false">
+          <datalist id="liste-zertifikate"></datalist>
+        </label>
+        <label>root-Passwort (nur falls kein sudo, für su)
+          <input id="f-rootpw" type="password" autocomplete="new-password">
+        </label>
+      </div>
+      <div class="knopfleiste">
+        <button type="submit" id="btn-verbinden" class="haupt">Verbinden (Erstzugang)</button>
+        <button type="button" id="btn-wartung" disabled>Als Wartungsbenutzer verbinden</button>
+        <span id="ziel-hinweis" class="hinweis"></span>
+      </div>
+    </form>
+  </section>
+
+  <!-- ================================================= verbunden -->
+  <section id="bereich-verbunden" hidden>
+    <div id="systeminfo" class="infozeile"></div>
+
+    <nav class="reiter" role="tablist">
+      <button data-reiter="voraussetzungen" class="aktiv">Voraussetzungen</button>
+      <button data-reiter="updates">Updates</button>
+      <button data-reiter="installiert">Installiert</button>
+      <button data-reiter="dist">Distributions-Upgrade</button>
+      <button data-reiter="einstellungen">Einstellungen</button>
+    </nav>
+
+    <!-- Voraussetzungen -->
+    <div id="reiter-voraussetzungen" class="karte reiter-inhalt">
+      <div class="knopfleiste">
+        <button id="btn-pruefen-vor">Prüfen</button>
+        <span id="vor-hinweis" class="hinweis"></span>
+      </div>
+      <table class="tabelle" id="tab-vor"><tbody></tbody></table>
+      <div id="einrichten-box" class="box" hidden>
+        <h3>Wartungszugang einrichten</h3>
+        <p>Legt auf dem Ziel einen eigenen Benutzer mit SSH-Schlüssel an. Per <code>sudo</code> darf er
+           <strong>nur</strong> das Hilfsskript für die Paketverwaltung ausführen (Updates, Installationen,
+           Distributions-Upgrade). Fehlt <code>sudo</code>, wird es über den Tunnel installiert.</p>
+        <div class="raster">
+          <label>Name des Wartungsbenutzers <input id="f-wartname" value="aptpflege" spellcheck="false"></label>
+          <label class="haken"><input type="checkbox" id="f-weiterleitung" checked>
+            sshd-Regel für diesen Benutzer: nur den Reverse-Tunnel erlauben (schaltet ihn frei, falls global gesperrt)</label>
+        </div>
+        <div class="knopfleiste">
+          <button id="btn-einrichten" class="haupt">Einrichten</button>
+          <button id="btn-zu-wartung" hidden>Jetzt als Wartungsbenutzer verbinden</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Updates -->
+    <div id="reiter-updates" class="karte reiter-inhalt" hidden>
+      <div class="knopfleiste">
+        <button id="btn-updates-pruefen" class="haupt">Auf Updates prüfen</button>
+        <input id="f-filter-updates" type="search" placeholder="Filter …">
+        <button id="btn-alle" class="leise">Alle</button>
+        <button id="btn-keine" class="leise">Keine</button>
+        <button id="btn-sicherheit" class="leise">Nur Sicherheit</button>
+        <span id="upd-zaehler" class="hinweis"></span>
+      </div>
+      <div id="upd-meldungen"></div>
+      <table class="tabelle" id="tab-updates">
+        <thead><tr><th></th><th>Paket</th><th>Installiert</th><th>Neu</th><th>Quelle</th><th></th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <div class="knopfleiste">
+        <button id="btn-einspielen" class="haupt" disabled data-eigen-aus="1">Ausgewählte einspielen …</button>
+        <button id="btn-autoremove">Nicht benötigte Pakete entfernen …</button>
+      </div>
+      <div class="box">
+        <h3>Paket installieren</h3>
+        <div class="knopfleiste">
+          <input id="f-neupaket" placeholder="Paketname(n), z. B. htop mc" spellcheck="false">
+          <button id="btn-installieren">Prüfen und installieren …</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Installiert -->
+    <div id="reiter-installiert" class="karte reiter-inhalt" hidden>
+      <div class="knopfleiste">
+        <button id="btn-installiert-laden">Laden</button>
+        <input id="f-filter-inst" type="search" placeholder="Filter nach Name oder Beschreibung …">
+        <span id="inst-zaehler" class="hinweis"></span>
+      </div>
+      <table class="tabelle" id="tab-installiert">
+        <thead><tr><th>Paket</th><th>Version</th><th>Arch</th><th class="zahl">Größe</th><th>Beschreibung</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+
+    <!-- Distributions-Upgrade -->
+    <div id="reiter-dist" class="karte reiter-inhalt" hidden>
+      <div id="dist-kopf"></div>
+      <ol class="schritte">
+        <li><strong>Simulation</strong> – lädt die Paketlisten des neuen Release in ein Testverzeichnis und
+            zeigt, was passieren würde. Am System ändert sich dabei nichts.</li>
+        <li><strong>Upgrade</strong> – Quellen umstellen (mit Sicherung), alles herunterladen, dann
+            installieren. Die Installation läuft auf dem Ziel <em>unabhängig</em> von der SSH-Verbindung weiter.</li>
+        <li><strong>Neustart</strong> – danach mit dem neuen Kernel neu starten.</li>
+      </ol>
+      <div class="knopfleiste">
+        <button id="btn-dist-laden" class="leise">Aktualisieren</button>
+        <button id="btn-dist-sim" class="haupt">Simulation starten</button>
+        <button id="btn-dist-start" class="gefahr" disabled>Distributions-Upgrade starten …</button>
+        <button id="btn-dist-zurueck" hidden>Quellen zurücksetzen</button>
+        <button id="btn-neustart" hidden>Neustart …</button>
+      </div>
+      <div id="dist-ergebnis"></div>
+    </div>
+
+    <!-- Einstellungen -->
+    <div id="reiter-einstellungen" class="karte reiter-inhalt" hidden>
+      <h3>Zusätzlich erlaubte Repository-Hosts</h3>
+      <p class="hinweis">Debian-Server (*.debian.org) sind immer erlaubt. Drittanbieter-Quellen des Ziels
+         (z. B. download.docker.com) müssen hier freigegeben werden.</p>
+      <ul id="liste-hosts" class="liste"></ul>
+      <div class="knopfleiste">
+        <input id="f-neuhost" placeholder="download.docker.com" spellcheck="false">
+        <button id="btn-host-add">Freigeben</button>
+      </div>
+      <h3>Paketquellen des Ziels</h3>
+      <div class="knopfleiste"><button id="btn-quellen">Anzeigen</button></div>
+      <pre id="quellen" class="code" hidden></pre>
+      <h3>Wartungszugang</h3>
+      <p class="hinweis">Entfernt Benutzer, sudo-Regel, Hilfsskript und die sshd-Freischaltung vom Ziel
+         (nur mit Erstzugang möglich). Protokolle bleiben erhalten.</p>
+      <div class="knopfleiste">
+        <button id="btn-entfernen" class="gefahr">Wartungszugang entfernen …</button>
+        <button id="btn-profil-loeschen" class="leise">Gespeichertes Ziel löschen</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================================================= Protokoll -->
+  <section id="karte-protokoll" class="karte" hidden>
+    <div class="protokoll-kopf">
+      <h2 id="protokoll-titel">Protokoll</h2>
+      <span id="protokoll-status" class="abzeichen"></span>
+      <label class="haken klein"><input type="checkbox" id="f-scroll" checked> mitlaufen</label>
+    </div>
+    <pre id="protokoll" class="code"></pre>
+  </section>
+</main>
+
+<dialog id="dlg">
+  <form method="dialog" id="dlg-form">
+    <h2 id="dlg-titel"></h2>
+    <div id="dlg-inhalt"></div>
+    <div class="knopfleiste rechts" id="dlg-knoepfe"></div>
+  </form>
+</dialog>
+
+<script src="/app.js"></script>
+</body>
+</html>

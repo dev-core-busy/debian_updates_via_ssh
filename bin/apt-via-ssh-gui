@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# apt-via-ssh-gui -- startet die Oberflaeche im Browser (nur 127.0.0.1)
+HIER="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+exec python3 "$HIER/gui/server.py" "$@"

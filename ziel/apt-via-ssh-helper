@@ -1,0 +1,402 @@
+#!/bin/bash
+#
+# apt-via-ssh-helper -- Paketverwaltung fuer den Wartungsbenutzer von apt-via-ssh
+#
+# Installiert als /usr/local/sbin/apt-via-ssh-helper (root:root, 0755).
+# Die sudoers-Regel erlaubt dem Wartungsbenutzer NUR dieses Skript.
+#
+# Sicherheitsprinzip: Es werden KEINE freien Optionen an apt weitergereicht.
+# (apt-get -o APT::Update::Pre-Invoke::=... wuerde sonst beliebige Befehle
+# als root ausfuehren.) Stattdessen gibt es feste Befehle mit geprueften
+# Argumenten: Proxy nur als http://127.0.0.1:PORT, Paketnamen nur nach
+# Debian-Namensregeln. Paketquellen werden nur fuer das Distributions-Upgrade
+# umgestellt (Codename alt -> neu), es koennen keine neuen Quellen oder
+# Schluessel hinzugefuegt werden. apt prueft weiterhin alle Signaturen.
+#
+set -uo pipefail
+HELFER_VERSION=2
+
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export LC_ALL=C.UTF-8 LANG=C.UTF-8
+export DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none NEEDRESTART_MODE=a
+umask 022
+
+ZUSTAND=/var/lib/apt-via-ssh
+PROTO=/var/log/apt-via-ssh
+
+fehler() { echo "FEHLER: $*" >&2; exit 2; }
+[ "$(id -u)" = 0 ] || fehler "muss als root laufen (sudo)"
+
+# ------------------------------------------------------------ Pruefungen
+pruef_proxy() {
+    [[ "${1:-}" =~ ^http://127\.0\.0\.1:[0-9]{1,5}$ ]] || fehler "ungültige Proxy-Adresse: ${1:-}"
+}
+pruef_pakete() {
+    [ $# -gt 0 ] || fehler "keine Paketnamen angegeben"
+    local p
+    for p in "$@"; do
+        [[ "$p" =~ ^[a-z0-9][a-z0-9+.-]*(:[a-z0-9-]+)?(=[A-Za-z0-9.+:~-]+)?$ ]] \
+            || fehler "ungültiger Paketname: $p"
+    done
+}
+
+APT_BASIS=(-q -o APT::Color=0 -o Dpkg::Use-Pty=0 -o DPkg::Lock::Timeout=120)
+APT_JA=(-y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
+# Vorab geladene Pakete liegen in einem eigenen Verzeichnis: Aufraeumregeln wie
+# docker-clean (DPkg::Post-Invoke) oder Keep-Downloaded-Packages=false loeschen
+# sonst zwischen Herunterladen und Installation den Cache -- ohne Netz fatal.
+PAKETE_DIR="$ZUSTAND/pakete"
+CACHE_OPT=(-o "Dir::Cache::archives=$PAKETE_DIR/" -o APT::Keep-Downloaded-Packages=true)
+paketdir() { mkdir -p "$PAKETE_DIR/partial"; }
+aufraeumen_zeile() { printf '%q ' find "$PAKETE_DIR" -maxdepth 1 -name '*.deb' -delete; }
+setze_proxy() { pruef_proxy "$1"; PROXY_OPT=(-o "Acquire::http::Proxy=$1" -o "Acquire::https::Proxy=$1"); }
+
+# MODUS [PAKETE] -> Feld OP
+setze_op() {
+    local modus="${1:-}"; shift || true
+    case "$modus" in
+        upgrade)      [ $# -eq 0 ] || fehler "upgrade nimmt keine Pakete"; OP=(upgrade) ;;
+        full-upgrade) [ $# -eq 0 ] || fehler "full-upgrade nimmt keine Pakete"; OP=(full-upgrade) ;;
+        autoremove)   [ $# -eq 0 ] || fehler "autoremove nimmt keine Pakete"; OP=(autoremove) ;;
+        install)      pruef_pakete "$@"; OP=(install "$@") ;;
+        only-upgrade) pruef_pakete "$@"; OP=(install --only-upgrade "$@") ;;
+        *) fehler "unbekannter Modus: ${modus:-<leer>}" ;;
+    esac
+}
+
+# ------------------------------------------------------- Simulation lesen
+# Wandelt "apt-get -s"-Ausgabe in Tabulator-Zeilen:
+#   U name alt neu herkunft arch   (Aktualisierung)
+#   N name -   neu herkunft arch   (neu installiert)
+#   R name alt                     (wird entfernt)
+#   S zusammenfassung
+sim_tsv() {
+    sed -nE \
+      -e 's/^Inst ([^ ]+) \[([^]]*)\] \(([^ ]+) ?(.*) \[([^]]*)\]\)( \[[^]]*\])?$/U\t\1\t\2\t\3\t\4\t\5/p' \
+      -e 's/^Inst ([^ ]+) \(([^ ]+) ?(.*) \[([^]]*)\]\)( \[[^]]*\])?$/N\t\1\t\t\2\t\3\t\4/p' \
+      -e 's/^(Remv|Purg) ([^ ]+) \[([^]]*)\].*$/R\t\2\t\3/p' \
+      -e 's/^(Remv|Purg) ([^ ]+)$/R\t\2\t/p' \
+      -e 's/^([0-9]+ upgraded, .*)$/S\t\1/p' \
+      -e 's/^E: (.*)$/F\tE: \1/p'
+}
+# Downloadgroesse (Bytes) der noch nicht vorhandenen Pakete
+download_bytes() {
+    apt-get -qq --print-uris -y "$@" 2>/dev/null | awk '/^'\''/{s+=$3} END{printf "G\t%d\n", s}'
+}
+
+# ---------------------------------------------------- abgekoppelte Auftraege
+job_laeuft() {
+    # fertig, sobald der Exit-Code vorliegt; Zombies (nicht abgeholte Prozesse) zaehlen nie als laufend
+    [ -f "$ZUSTAND/job.rc" ] && return 1
+    local pid; pid="$(cat "$ZUSTAND/job.pid" 2>/dev/null)"
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    [ -r "/proc/$pid/stat" ] || return 1
+    local st; st="$(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null)"
+    [ -n "$st" ] && [ "$st" != Z ] && [ "$st" != X ]
+}
+# job_start TITEL ZEILE...   (jede ZEILE ist eine bereits sicher gequotete Befehlszeile)
+job_start() {
+    local titel="$1"; shift
+    mkdir -p "$ZUSTAND" "$PROTO"
+    if job_laeuft; then fehler "es laeuft bereits ein Auftrag: $(cat "$ZUSTAND/job.titel" 2>/dev/null)"; fi
+    local id; id="$(date +%Y%m%d-%H%M%S)"
+    local log="$PROTO/job-$id.log" skript="$ZUSTAND/job.sh" z
+    {
+        echo '#!/bin/bash'
+        printf 'export PATH=%q LC_ALL=C.UTF-8 LANG=C.UTF-8\n' "$PATH"
+        echo 'export DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none NEEDRESTART_MODE=a'
+        printf 'echo $$ > %q\n' "$ZUSTAND/job.pid"
+        for z in "$@"; do
+            printf 'echo %q\n' ">>> $z"
+            printf '%s\n' "$z"
+            printf 'rc=$?; if [ $rc -ne 0 ]; then echo ">>> Abbruch, Exit-Code $rc"; echo "$rc" > %q; exit $rc; fi\n' "$ZUSTAND/job.rc"
+        done
+        echo 'echo ">>> Fertig"'
+        printf 'echo 0 > %q\n' "$ZUSTAND/job.rc"
+    } > "$skript"
+    chmod 0700 "$skript"
+    rm -f "$ZUSTAND/job.rc" "$ZUSTAND/job.pid"
+    printf '%s\n' "$id" > "$ZUSTAND/job.id"
+    printf '%s\n' "$titel" > "$ZUSTAND/job.titel"
+    ln -sfn "$log" "$ZUSTAND/job.log"
+    # setsid: eigene Sitzung -> kein SIGHUP, wenn die SSH-Verbindung abbricht
+    setsid nohup /bin/bash "$skript" </dev/null >"$log" 2>&1 &
+    local i
+    for i in $(seq 1 50); do [ -s "$ZUSTAND/job.pid" ] && break; sleep 0.1; done
+    echo "id=$id"
+}
+job_status() {
+    local ab="${1:-0}"
+    [[ "$ab" =~ ^[0-9]+$ ]] || fehler "ungültiger Offset"
+    if [ ! -f "$ZUSTAND/job.id" ]; then echo "status=keiner"; echo "---"; return 0; fi
+    local st rc=""
+    if job_laeuft; then st=laeuft
+    elif [ -f "$ZUSTAND/job.rc" ]; then rc="$(cat "$ZUSTAND/job.rc")"; [ "$rc" = 0 ] && st=ok || st=fehler
+    elif [ ! -f "$ZUSTAND/job.pid" ]; then st=laeuft   # gerade gestartet
+    else st=abgebrochen; fi
+    echo "status=$st"
+    echo "rc=$rc"
+    echo "id=$(cat "$ZUSTAND/job.id")"
+    echo "titel=$(cat "$ZUSTAND/job.titel" 2>/dev/null)"
+    # genau die Bytes [ab, ende) ausgeben, damit der Aufrufer exakt weiterlesen kann
+    # -L: job.log ist ein Symlink -- gemessen wird die Protokolldatei, nicht der Link
+    local ende; ende="$(stat -L -c %s "$ZUSTAND/job.log" 2>/dev/null || echo 0)"
+    [ "$ab" -le "$ende" ] || ab="$ende"
+    echo "ende=$ende"
+    echo "---"
+    head -c "$ende" "$ZUSTAND/job.log" 2>/dev/null | tail -c +"$((ab + 1))" || true
+}
+
+# ------------------------------------------------------------ Distribution
+codename() {
+    local c=""
+    if [ -r /etc/os-release ]; then
+        c="$(. /etc/os-release; echo "${VERSION_CODENAME:-}")"
+        [ -n "$c" ] || c="$(. /etc/os-release; echo "${VERSION:-}" | sed -n 's/.*(\(.*\)).*/\1/p')"
+    fi
+    printf '%s\n' "$c"
+}
+distro_id() { (. /etc/os-release 2>/dev/null; echo "${ID:-}"); }
+naechste() {
+    case "$1" in
+        buster) echo bullseye ;; bullseye) echo bookworm ;;
+        bookworm) echo trixie ;; trixie) echo forky ;; forky) echo duke ;;
+        *) echo "" ;;
+    esac
+}
+quelldateien() {
+    local f
+    [ -f /etc/apt/sources.list ] && echo /etc/apt/sources.list
+    for f in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+        [ -f "$f" ] && echo "$f"
+    done
+}
+# Codename in einer Quelldatei umschreiben (stdin -> stdout).
+# Erfasst: alt, alt-security, alt-updates, alt-backports, alt/updates (buster)
+umschreiben() {
+    local alt="$1" neu="$2" art="$3"
+    if [ "$art" = sources ]; then
+        awk -v alt="$alt" -v neu="$neu" '
+            function fix(s) { if (s == alt) return neu
+                              if (s == alt "/updates") return neu "-security"
+                              if (index(s, alt "-") == 1) return neu substr(s, length(alt) + 1)
+                              return s }
+            /^Suites:/ { n = split(substr($0, 8), a, /[ \t]+/); z = "Suites:"
+                         for (j = 1; j <= n; j++) if (a[j] != "") z = z " " fix(a[j])
+                         print z; next }
+            { print }'
+    else
+        awk -v alt="$alt" -v neu="$neu" '
+            function fix(s) { if (s == alt) return neu
+                              if (s == alt "/updates") return neu "-security"
+                              if (index(s, alt "-") == 1) return neu substr(s, length(alt) + 1)
+                              return s }
+            /^[ \t]*deb(-src)?[ \t]/ {
+                i = 2
+                if ($2 ~ /^\[/) { while (i <= NF && $i !~ /\]$/) i++; i++ }
+                if (i + 1 <= NF) { s = i + 1; neu_s = fix($s); if (neu_s != $s) { $s = neu_s } }
+                print; next }
+            { print }'
+    fi
+}
+# Quellen nach ZIEL umgeschrieben anlegen (ZIEL = Verzeichnis mit sources.list + sources.list.d)
+quellen_kopie() {
+    local alt="$1" neu="$2" ziel="$3" f art
+    mkdir -p "$ziel/sources.list.d"
+    : > "$ziel/sources.list"
+    while read -r f; do
+        art=list; [[ "$f" == *.sources ]] && art=sources
+        if [ "$f" = /etc/apt/sources.list ]; then
+            umschreiben "$alt" "$neu" "$art" < "$f" > "$ziel/sources.list"
+        else
+            umschreiben "$alt" "$neu" "$art" < "$f" > "$ziel/sources.list.d/$(basename "$f")"
+        fi
+    done < <(quelldateien)
+}
+dist_pruefen() {
+    [ "$(distro_id)" = debian ] || fehler "Distributions-Upgrade wird nur für Debian unterstützt (hier: $(distro_id))"
+    ALT="$(codename)"; NEU="$(naechste "$ALT")"
+    [ -n "$ALT" ] && [ -n "$NEU" ] || fehler "kein Nachfolger für Codename '${ALT:-?}' bekannt"
+}
+
+# ---------------------------------------------------------------- Befehle
+befehl="${1:-}"; shift || true
+case "$befehl" in
+    version)
+        echo "$HELFER_VERSION" ;;
+
+    info)
+        c="$(codename)"
+        echo "os=$(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-unbekannt}")"
+        echo "id=$(distro_id)"
+        echo "codename=$c"
+        echo "naechste=$(naechste "$c")"
+        echo "debian_version=$(cat /etc/debian_version 2>/dev/null)"
+        echo "arch=$(dpkg --print-architecture)"
+        echo "kernel=$(uname -r)"
+        echo "rechnername=$(hostname)"
+        echo "frei_var_mb=$(df -Pm /var | awk 'NR==2{print $4}')"
+        echo "frei_root_mb=$(df -Pm / | awk 'NR==2{print $4}')"
+        if mountpoint -q /boot 2>/dev/null; then echo "frei_boot_mb=$(df -Pm /boot | awk 'NR==2{print $4}')"; fi
+        [ -f /run/reboot-required ] && echo "neustart=ja" || echo "neustart=nein"
+        echo "gehalten=$(apt-mark showhold 2>/dev/null | tr '\n' ' ')"
+        echo "pakete=$(dpkg-query -W -f='${db:Status-Abbrev}\n' 2>/dev/null | grep -c '^ii')"
+        a="$(dpkg --audit 2>/dev/null)"; [ -z "$a" ] && echo "dpkg_ok=ja" || echo "dpkg_ok=nein"
+        job_laeuft && echo "auftrag=laeuft" || echo "auftrag=keiner"
+        [ -f "$ZUSTAND/dist.vorbereitet" ] && echo "dist_vorbereitet=$(cat "$ZUSTAND/dist.vorbereitet")" || echo "dist_vorbereitet="
+        echo "helfer_version=$HELFER_VERSION"
+        ;;
+
+    installiert)
+        dpkg-query -W -f='${db:Status-Abbrev}\t${Package}\t${Version}\t${Architecture}\t${Installed-Size}\t${binary:Summary}\n' \
+            | awk -F'\t' 'substr($1,1,2)=="ii" { sub(/^[^\t]*\t/, ""); print }' ;;
+
+    update)
+        setze_proxy "${1:-}"
+        apt-get "${APT_BASIS[@]}" "${PROXY_OPT[@]}" update ;;
+
+    update-streng)
+        # wie update, aber JEDER Ladefehler ist ein Fehler (apt meldet sonst nur W: und Exit 0)
+        setze_proxy "${1:-}"
+        aus="$(apt-get "${APT_BASIS[@]}" "${PROXY_OPT[@]}" update 2>&1)"; rc=$?
+        printf '%s\n' "$aus"
+        if [ "$rc" -eq 0 ] && printf '%s\n' "$aus" | grep -qE '^(W: Failed to fetch|W: Some index files failed|E: |Err:)'; then
+            echo "FEHLER: nicht alle Paketlisten konnten geladen werden" >&2
+            exit 100
+        fi
+        exit "$rc" ;;
+
+    aktualisierbar)
+        # vollstaendige Liste (full-upgrade) + Markierung, was auch ein normales upgrade nimmt
+        apt-get -s -o Debug::NoLocking=1 "${APT_BASIS[@]}" full-upgrade 2>/dev/null | sim_tsv
+        apt-get -s -o Debug::NoLocking=1 "${APT_BASIS[@]}" upgrade 2>/dev/null | awk '/^Inst /{print "P\t" $2}' ;;
+
+    simulieren)
+        setze_op "$@"
+        aus="$(apt-get -s -o Debug::NoLocking=1 "${APT_BASIS[@]}" "${OP[@]}" 2>&1)"; rc=$?
+        printf '%s\n' "$aus" | sim_tsv
+        [ "$rc" -eq 0 ] || exit "$rc"
+        paketdir
+        download_bytes -o Debug::NoLocking=1 "${CACHE_OPT[@]}" "${OP[@]}" ;;
+
+    laden)
+        setze_proxy "${1:-}"; shift
+        setze_op "$@"
+        paketdir
+        apt-get "${APT_BASIS[@]}" "${PROXY_OPT[@]}" "${CACHE_OPT[@]}" "${APT_JA[@]}" -d "${OP[@]}" ;;
+
+    starten)
+        setze_op "$@"
+        paketdir
+        z="$(printf '%q ' apt-get "${APT_BASIS[@]}" "${CACHE_OPT[@]}" "${APT_JA[@]}" --no-download "${OP[@]}")"
+        job_start "apt-get ${OP[*]}" "$z" "$(aufraeumen_zeile)" ;;
+
+    anwenden)   # Vordergrund mit Proxy (fuer die Kommandozeile)
+        setze_proxy "${1:-}"; shift
+        setze_op "$@"
+        apt-get "${APT_BASIS[@]}" "${PROXY_OPT[@]}" "${APT_JA[@]}" "${OP[@]}" ;;
+
+    auftrag)
+        job_status "${1:-0}" ;;
+
+    quellen)
+        while read -r f; do
+            echo "### $f"
+            sed -E 's#(://)[^/@[:space:]]+@#\1***@#g' "$f"
+        done < <(quelldateien) ;;
+
+    dist-info)
+        dist_pruefen
+        echo "alt=$ALT"; echo "neu=$NEU"
+        echo "frei_var_mb=$(df -Pm /var | awk 'NR==2{print $4}')"
+        tmp="$(mktemp -d)"; quellen_kopie "$ALT" "$NEU" "$tmp"
+        while read -r f; do
+            k="$tmp/sources.list"; [ "$f" = /etc/apt/sources.list ] || k="$tmp/sources.list.d/$(basename "$f")"
+            if cmp -s "$f" "$k"; then echo "quelle_gleich=$f"; else echo "quelle_neu=$f"; fi
+        done < <(quelldateien)
+        rm -rf "$tmp" ;;
+
+    dist-simulieren)
+        setze_proxy "${1:-}"
+        dist_pruefen
+        sim="$ZUSTAND/dist-sim"; rm -rf "$sim"; mkdir -p "$sim/lists/partial"
+        quellen_kopie "$ALT" "$NEU" "$sim/etc"
+        ALT_OPT=(-o "Dir::Etc::sourcelist=$sim/etc/sources.list"
+                 -o "Dir::Etc::sourceparts=$sim/etc/sources.list.d"
+                 -o "Dir::State::Lists=$sim/lists"
+                 -o "Dir::Cache::pkgcache=" -o "Dir::Cache::srcpkgcache=")
+        echo "I	Simuliere $ALT -> $NEU"
+        apt-get "${APT_BASIS[@]}" "${PROXY_OPT[@]}" "${ALT_OPT[@]}" update 2>&1 \
+            | sed -nE -e 's/^(E|W|Err):?(.*)$/F\t\1:\2/p'
+        # Suite des neuen Release (stable oder testing?)
+        r="$(ls "$sim"/lists/*_dists_"${NEU}"_InRelease 2>/dev/null | head -1)"
+        [ -n "$r" ] && echo "Q	$(sed -n 's/^Suite: //p' "$r" | head -1)"
+        apt-get -s -o Debug::NoLocking=1 "${APT_BASIS[@]}" "${ALT_OPT[@]}" full-upgrade 2>/dev/null | sim_tsv
+        paketdir
+        download_bytes -o Debug::NoLocking=1 "${ALT_OPT[@]}" "${CACHE_OPT[@]}" full-upgrade
+        rm -rf "$sim" ;;
+
+    dist-vorbereiten)
+        dist_pruefen
+        job_laeuft && fehler "es läuft gerade ein Auftrag"
+        mkdir -p "$ZUSTAND"
+        sicherung="$ZUSTAND/quellen-vor-$NEU-$(date +%Y%m%d-%H%M%S).tar"
+        (cd / && tar -cf "$sicherung" etc/apt/sources.list etc/apt/sources.list.d 2>/dev/null) \
+            || [ -s "$sicherung" ] || fehler "Sicherung der Quellen fehlgeschlagen"
+        tmp="$(mktemp -d)"; quellen_kopie "$ALT" "$NEU" "$tmp"
+        while read -r f; do
+            k="$tmp/sources.list"; [ "$f" = /etc/apt/sources.list ] || k="$tmp/sources.list.d/$(basename "$f")"
+            if ! cmp -s "$f" "$k"; then cat "$k" > "$f"; echo "umgestellt: $f"; fi
+        done < <(quelldateien)
+        rm -rf "$tmp"
+        printf '%s %s %s\n' "$ALT" "$NEU" "$sicherung" > "$ZUSTAND/dist.vorbereitet"
+        echo "Sicherung: $sicherung" ;;
+
+    dist-starten)
+        [ -f "$ZUSTAND/dist.vorbereitet" ] || fehler "zuerst dist-vorbereiten"
+        read -r alt neu _ < "$ZUSTAND/dist.vorbereitet"
+        paketdir
+        z1="$(printf '%q ' apt-get "${APT_BASIS[@]}" "${CACHE_OPT[@]}" "${APT_JA[@]}" --no-download upgrade --without-new-pkgs)"
+        z2="$(printf '%q ' apt-get "${APT_BASIS[@]}" "${CACHE_OPT[@]}" "${APT_JA[@]}" --no-download full-upgrade)"
+        z3="$(printf '%q ' rm -f "$ZUSTAND/dist.vorbereitet")"
+        job_start "Distributions-Upgrade $alt -> $neu" "$z1" "$z2" "$z3" "$(aufraeumen_zeile)" ;;
+
+    dist-zuruecksetzen)
+        [ -f "$ZUSTAND/dist.vorbereitet" ] || fehler "es ist kein Distributions-Upgrade vorbereitet"
+        job_laeuft && fehler "es läuft gerade ein Auftrag"
+        read -r alt neu sicherung < "$ZUSTAND/dist.vorbereitet"
+        [ -s "$sicherung" ] || fehler "Sicherung fehlt: $sicherung"
+        (cd / && tar -xf "$sicherung") || fehler "Wiederherstellen fehlgeschlagen"
+        rm -f "$ZUSTAND/dist.vorbereitet"
+        echo "Quellen wiederhergestellt ($alt). Bitte Paketlisten neu laden." ;;
+
+    quelle-deaktivieren)
+        n="${1:-}"
+        [[ "$n" =~ ^[A-Za-z0-9._-]+\.(list|sources)$ ]] || fehler "ungültiger Dateiname"
+        [ -f "/etc/apt/sources.list.d/$n" ] || fehler "nicht gefunden: $n"
+        mv "/etc/apt/sources.list.d/$n" "/etc/apt/sources.list.d/$n.deaktiviert-apt-via-ssh"
+        echo "deaktiviert: $n" ;;
+
+    neustart)
+        job_laeuft && fehler "es läuft gerade ein Auftrag"
+        if command -v shutdown >/dev/null && shutdown -r +1 "apt-via-ssh: Neustart nach Aktualisierung" 2>/dev/null; then
+            echo "Neustart in 1 Minute geplant."
+        else
+            (sleep 5; reboot) >/dev/null 2>&1 </dev/null &
+            echo "Neustart in 5 Sekunden."
+        fi ;;
+
+    *)
+        cat >&2 <<'TXT'
+apt-via-ssh-helper BEFEHL ...
+  version | info | installiert | quellen | auftrag [AB]
+  update PROXY | update-streng PROXY | aktualisierbar
+  simulieren MODUS [PAKETE] | laden PROXY MODUS [PAKETE] | starten MODUS [PAKETE]
+  anwenden PROXY MODUS [PAKETE]
+  dist-info | dist-simulieren PROXY | dist-vorbereiten | dist-starten | dist-zuruecksetzen
+  quelle-deaktivieren DATEI | neustart
+MODUS: upgrade | full-upgrade | autoremove | install PAKET... | only-upgrade PAKET...
+PROXY: http://127.0.0.1:PORT
+TXT
+        exit 2 ;;
+esac
