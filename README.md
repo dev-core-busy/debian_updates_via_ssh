@@ -29,6 +29,7 @@ Proxy wieder weg.
 | `bin/apt-offline-sync` | **Fallback**, falls das Ziel keine Port-Weiterleitung erlaubt (`AllowTcpForwarding no`) |
 | `etc/apt-via-ssh.conf.example` | Beispielkonfiguration |
 | `tests/rauchtest.sh` | Rauchtest, der das Ziel nicht verändert |
+| `tests/docker-test.sh` | Integrationstest gegen echte, abgeschottete Debian-Container |
 
 ## Schnellstart
 
@@ -57,7 +58,7 @@ Benutzer auf dem Ziel `NOPASSWD` für apt-get.
 | `upgrade` / `full-upgrade` | update + upgrade bzw. full-upgrade |
 | `install PAKET …` | update + install |
 | `download PAKET …` | nur herunterladen (für ein späteres Wartungsfenster) |
-| `run 'BEFEHL'` | beliebiger Befehl mit gesetztem `http_proxy`/`https_proxy` |
+| `run BEFEHL …` | beliebiger Befehl mit gesetztem `http_proxy`/`https_proxy`; alles nach `run` wird unverändert weitergegeben, ein einzelnes Argument läuft als Shell-Skript (`run 'a \| b'`) |
 | `tunnel` | Tunnel offen halten und selbst auf dem Ziel arbeiten (bis Strg-C) |
 
 Wichtige Optionen: `-y` (ohne Rückfrage), `-s` (nur simulieren), `-d` (nur
@@ -152,8 +153,30 @@ Die bisherigen Paketlisten des Ziels werden nach
 | `403 Forbidden` / `Invalid response from proxy` | Host nicht in der Whitelist → `--allow HOST` |
 | `Proxy ist vom Zielsystem aus nicht erreichbar` | mit `-v --proxy-debug` wiederholen |
 
-Rauchtest (verändert das Ziel nicht):
+## Tests
+
+Rauchtest gegen ein beliebiges Ziel (verändert es nicht, nur `update` und Simulationen):
 
 ```bash
 tests/rauchtest.sh root@10.0.0.5
 ```
+
+Integrationstest mit Docker: Er baut aus einem älteren Debian-Image (damit echte
+Updates anstehen) ein Ziel mit sshd, ohne curl, wget und python3, und startet zwei Container in einem Docker-Netz **ohne Internet**
+(`--internal`). Geprüft werden:
+
+- dass die Container wirklich keine Verbindung nach draußen haben,
+- echte Upgrades und Installationen über `apt-via-ssh`, als root und als
+  Benutzer mit `sudo`,
+- der Paket-Cache, `run` und das Aufräumen,
+- ein zweiter Container mit `AllowTcpForwarding no`: verständliche
+  Fehlermeldung, danach Upgrade und Installation über `apt-offline-sync`.
+
+```bash
+tests/docker-test.sh                   # Ziel: Debian 12 vom Mai 2024, viele Updates offen
+```
+```bash
+DEBIAN_TAG=trixie tests/docker-test.sh  # Ziel: aktuelles Debian 13
+```
+
+Container und Netz werden danach entfernt, das Image bleibt für Wiederholungen.
