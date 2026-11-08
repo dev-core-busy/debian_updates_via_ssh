@@ -1,0 +1,476 @@
+#!/usr/bin/env bash
+#
+# apt-via-ssh -- Debian-Updates fuer ein System ohne Internetzugang,
+#                das nur per SSH (Port 22) erreichbar ist.
+#
+# Prinzip:
+#   1. Auf dem Gateway (dieser Rechner, hat Internet) laeuft ein kleiner
+#      HTTP-Proxy, der nur auf 127.0.0.1 lauscht.
+#   2. Eine SSH-Verbindung zum Zielsystem richtet einen Reverse-Tunnel ein
+#      (ssh -R): das Ziel erreicht den Proxy unter 127.0.0.1:<port>.
+#   3. apt-get laeuft auf dem Ziel mit -o Acquire::http::Proxy=... Es wird
+#      KEINE Datei auf dem Ziel geaendert; nach dem Lauf bleibt nichts zurueck.
+#
+# Es wird kein zusaetzlicher Port geoeffnet, und die Richtung des
+# Datenverkehrs bleibt "Gateway -> Ziel ueber Port 22".
+#
+set -euo pipefail
+
+VERSION="1.0"
+SELBST="${0##*/}"
+HIER="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+PROXY_SKRIPT="$HIER/gateway/apt_proxy.py"
+
+# ------------------------------------------------------------- Vorgabewerte
+ZIEL=""
+BEFEHL=""
+declare -a BEFEHL_ARGS=()
+SSH_PORT="22"
+SSH_IDENTITAET=""
+declare -a SSH_EXTRA=()
+CACHE_VERZ="${XDG_CACHE_HOME:-$HOME/.cache}/apt-via-ssh/pakete"
+CACHE_MAX_MB="1024"
+EXTERNER_PROXY=""          # z.B. 127.0.0.1:3142 (apt-cacher-ng), dann kein eigener Proxy
+declare -a ERLAUBTE_HOSTS=()
+SUDO_MODUS="auto"          # auto | ja | nein
+JA=0                       # -y an apt durchreichen
+TROCKEN=0                  # Simulation (apt-get -s)
+NUR_LADEN=0                # apt-get -d
+AUSFUEHRLICH=0
+PROXY_DEBUG=0
+HALTEZEIT="0"              # fuer 'tunnel': Sekunden offenhalten (0 = bis Strg-C)
+KONFIG=""
+
+# ------------------------------------------------------------ Hilfsfunktionen
+rot()  { [ -t 2 ] && printf '\033[31m%s\033[0m\n' "$*" >&2 || printf '%s\n' "$*" >&2; }
+gelb() { [ -t 2 ] && printf '\033[33m%s\033[0m\n' "$*" >&2 || printf '%s\n' "$*" >&2; }
+gruen(){ [ -t 2 ] && printf '\033[32m%s\033[0m\n' "$*" >&2 || printf '%s\n' "$*" >&2; }
+info() { printf '[%s] %s\n' "$SELBST" "$*" >&2; }
+laut() { [ "$AUSFUEHRLICH" -eq 1 ] && printf '[%s] %s\n' "$SELBST" "$*" >&2 || true; }
+fehler(){ rot "FEHLER: $*"; exit 1; }
+
+# Shell-Quoting fuer die Gegenseite
+sq() { local s=${1-}; printf "'%s'" "${s//\'/\'\\\'\'}"; }
+
+hilfe() {
+cat <<'TXT'
+apt-via-ssh -- Debian-Updates ueber einen SSH-Reverse-Tunnel
+
+AUFRUF
+  apt-via-ssh [OPTIONEN] ZIEL BEFEHL [ARGUMENTE ...]
+
+  ZIEL   SSH-Ziel: host, benutzer@host oder ein Alias aus ~/.ssh/config
+
+BEFEHLE
+  check                 Paketlisten holen und anstehende Updates auflisten
+  update                nur apt-get update
+  upgrade               update + apt-get upgrade
+  full-upgrade          update + apt-get full-upgrade (entfernt notfalls Pakete)
+  install PAKET ...     update + apt-get install
+  download PAKET ...    Pakete nur herunterladen (apt-get -d), nichts installieren
+  run BEFEHL ...        beliebigen Befehl auf dem Ziel mit gesetztem Proxy ausfuehren
+                        (http_proxy/https_proxy sind in der Umgebung gesetzt)
+  tunnel                Proxy bereitstellen und Tunnel offenhalten; der Befehl
+                        zeigt an, wie apt auf dem Ziel von Hand zu nutzen ist
+  selftest              Verbindung, Tunnel und Proxy pruefen, sonst nichts tun
+
+OPTIONEN
+  -p, --ssh-port PORT   SSH-Port des Ziels (Vorgabe: 22)
+  -i, --identity DATEI  SSH-Schluessel
+  -o, --ssh-option OPT  zusaetzliche Option fuer ssh (-o ...), mehrfach moeglich
+      --sudo            apt auf dem Ziel mit sudo -n ausfuehren
+      --no-sudo         ohne sudo (Vorgabe, wenn der Benutzer root ist)
+      --allow HOST      weiteren Repository-Host erlauben (mehrfach moeglich),
+                        z.B. --allow download.docker.com
+      --cache VERZ      Paket-Cache auf dem Gateway (Vorgabe: ~/.cache/apt-via-ssh/pakete)
+      --no-cache        ohne Platten-Cache arbeiten
+      --cache-max-mb N  Dateien groesser als N MiB nicht cachen (Vorgabe: 1024)
+      --use-proxy H:P   bereits laufenden Proxy nutzen (z.B. apt-cacher-ng 127.0.0.1:3142)
+                        statt des mitgelieferten Python-Proxys
+  -y, --yes             apt ohne Rueckfrage (setzt DEBIAN_FRONTEND=noninteractive)
+  -s, --dry-run         nur simulieren (apt-get -s)
+  -d, --download-only   Pakete holen, aber nicht installieren
+      --halten SEK      bei 'tunnel': so lange offenhalten (0 = bis Strg-C)
+  -c, --config DATEI    Konfigurationsdatei (Vorgabe: ~/.config/apt-via-ssh.conf)
+  -v, --verbose         mehr Ausgabe
+      --proxy-debug     Proxy-Protokoll ausfuehrlich
+  -V, --version         Version anzeigen
+  -h, --help            diese Hilfe
+
+BEISPIELE
+  apt-via-ssh root@192.0.2.10 check
+  apt-via-ssh root@192.0.2.10 upgrade -y
+  apt-via-ssh --sudo admin@kiosk install -y htop mc
+  apt-via-ssh --allow download.docker.com root@ziel update
+  apt-via-ssh root@ziel tunnel            # dann auf dem Ziel selbst arbeiten
+
+VORAUSSETZUNGEN
+  Gateway: Python 3.9+, ssh, Internetzugang
+  Ziel:    sshd mit AllowTcpForwarding yes (Vorgabe), apt, root bzw. sudo
+TXT
+}
+
+# -------------------------------------------------------- Konfiguration laden
+lade_konfig() {
+    local datei="$1"
+    [ -r "$datei" ] || return 0
+    laut "Konfiguration: $datei"
+    # Nur bekannte Schluessel uebernehmen, Zeile fuer Zeile.
+    local zeile schluessel wert
+    while IFS= read -r zeile; do
+        zeile="${zeile%%#*}"
+        zeile="$(printf '%s' "$zeile" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+        [ -z "$zeile" ] && continue
+        schluessel="${zeile%%=*}"; wert="${zeile#*=}"
+        wert="${wert%\"}"; wert="${wert#\"}"
+        wert="${wert%\'}"; wert="${wert#\'}"
+        case "$schluessel" in
+            SSH_PORT)      SSH_PORT="$wert" ;;
+            SSH_IDENTITAET|SSH_IDENTITY) SSH_IDENTITAET="$wert" ;;
+            CACHE_VERZ|CACHE_DIR)        CACHE_VERZ="$wert" ;;
+            CACHE_MAX_MB)  CACHE_MAX_MB="$wert" ;;
+            EXTERNER_PROXY|USE_PROXY)    EXTERNER_PROXY="$wert" ;;
+            SUDO_MODUS)    SUDO_MODUS="$wert" ;;
+            ERLAUBTE_HOSTS|ALLOW_HOSTS)
+                # Leerzeichen- oder Komma-getrennte Liste
+                local h
+                for h in ${wert//,/ }; do ERLAUBTE_HOSTS+=("$h"); done ;;
+            *) gelb "Unbekannter Schluessel in $datei: $schluessel" ;;
+        esac
+    done < "$datei"
+}
+
+# ------------------------------------------------------------ Argumente lesen
+# Erst --config suchen, damit CLI-Optionen die Datei ueberschreiben koennen.
+vorab=("$@")
+for ((i=0; i<${#vorab[@]}; i++)); do
+    case "${vorab[i]}" in
+        -c|--config) KONFIG="${vorab[i+1]:-}" ;;
+    esac
+done
+lade_konfig "${KONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/apt-via-ssh.conf}"
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h|--help)    hilfe; exit 0 ;;
+        -V|--version) echo "$SELBST $VERSION"; exit 0 ;;
+        -p|--ssh-port)   SSH_PORT="${2:?Port fehlt}"; shift 2 ;;
+        -i|--identity)   SSH_IDENTITAET="${2:?Datei fehlt}"; shift 2 ;;
+        -o|--ssh-option) SSH_EXTRA+=(-o "${2:?Option fehlt}"); shift 2 ;;
+        --sudo)          SUDO_MODUS="ja"; shift ;;
+        --no-sudo)       SUDO_MODUS="nein"; shift ;;
+        --allow)         ERLAUBTE_HOSTS+=("${2:?Host fehlt}"); shift 2 ;;
+        --cache)         CACHE_VERZ="${2:?Verzeichnis fehlt}"; shift 2 ;;
+        --no-cache)      CACHE_VERZ=""; shift ;;
+        --cache-max-mb)  CACHE_MAX_MB="${2:?Zahl fehlt}"; shift 2 ;;
+        --use-proxy)     EXTERNER_PROXY="${2:?host:port fehlt}"; shift 2 ;;
+        -y|--yes)        JA=1; shift ;;
+        -s|--dry-run)    TROCKEN=1; shift ;;
+        -d|--download-only) NUR_LADEN=1; shift ;;
+        --halten)        HALTEZEIT="${2:?Sekunden fehlen}"; shift 2 ;;
+        -c|--config)     shift 2 ;;
+        -v|--verbose)    AUSFUEHRLICH=1; shift ;;
+        --proxy-debug)   PROXY_DEBUG=1; shift ;;
+        --) shift; break ;;
+        -*) fehler "Unbekannte Option: $1  (--help zeigt die Hilfe)" ;;
+        *)
+            if [ -z "$ZIEL" ]; then ZIEL="$1"
+            elif [ -z "$BEFEHL" ]; then BEFEHL="$1"
+            else BEFEHL_ARGS+=("$1")
+            fi
+            shift ;;
+    esac
+done
+# Restliche Argumente nach '--'
+while [ $# -gt 0 ]; do
+    if [ -z "$ZIEL" ]; then ZIEL="$1"
+    elif [ -z "$BEFEHL" ]; then BEFEHL="$1"
+    else BEFEHL_ARGS+=("$1"); fi
+    shift
+done
+
+[ -n "$ZIEL" ]   || { hilfe; exit 1; }
+[ -n "$BEFEHL" ] || fehler "Kein Befehl angegeben (check, update, upgrade, full-upgrade, install, download, run, tunnel, selftest)"
+
+case "$BEFEHL" in
+    check|update|upgrade|full-upgrade|dist-upgrade|install|download|run|tunnel|selftest) ;;
+    *) fehler "Unbekannter Befehl: $BEFEHL" ;;
+esac
+case "$BEFEHL" in
+    install|download|run)
+        [ ${#BEFEHL_ARGS[@]} -gt 0 ] || fehler "'$BEFEHL' braucht mindestens ein Argument" ;;
+esac
+
+# -------------------------------------------------------------- SSH-Rahmenwerk
+ARBEIT="$(mktemp -d -t apt-via-ssh.XXXXXX)"
+STEUERSOCKET="$ARBEIT/ssh.sock"
+PROXY_LOG="$ARBEIT/proxy.log"
+PROXY_PID=""
+RPORT=""
+MASTER_LAEUFT=0
+
+declare -a SSH_BASIS=(
+    ssh -p "$SSH_PORT"
+    -o ControlPath="$STEUERSOCKET"
+    -o BatchMode=no
+    -o ServerAliveInterval=30
+    -o ServerAliveCountMax=4
+    -o ExitOnForwardFailure=yes
+)
+[ -n "$SSH_IDENTITAET" ] && SSH_BASIS+=(-i "$SSH_IDENTITAET")
+[ ${#SSH_EXTRA[@]} -gt 0 ] && SSH_BASIS+=("${SSH_EXTRA[@]}")
+
+aufraeumen() {
+    local status=$?
+    set +e
+    if [ -n "$RPORT" ] && [ "$MASTER_LAEUFT" -eq 1 ]; then
+        laut "Tunnel schliessen (Remote-Port $RPORT)"
+        "${SSH_BASIS[@]}" -O cancel -R "${RPORT}:127.0.0.1:${LPORT:-0}" "$ZIEL" >/dev/null 2>&1
+    fi
+    if [ "$MASTER_LAEUFT" -eq 1 ]; then
+        laut "SSH-Verbindung beenden"
+        "${SSH_BASIS[@]}" -O exit "$ZIEL" >/dev/null 2>&1
+    fi
+    if [ -n "$PROXY_PID" ] && kill -0 "$PROXY_PID" 2>/dev/null; then
+        laut "Proxy beenden (PID $PROXY_PID)"
+        kill "$PROXY_PID" 2>/dev/null
+        wait "$PROXY_PID" 2>/dev/null
+    fi
+    if [ -s "$PROXY_LOG" ]; then
+        local gesperrt
+        gesperrt="$(sed -n 's/.*ABGELEHNT \(CONNECT \)\{0,1\}\([^ ]*\) .*/\2/p' "$PROXY_LOG" | sort -u | tr '\n' ' ')"
+        if [ -n "$gesperrt" ]; then
+            gelb "Folgende Repository-Hosts wurden von der Whitelist blockiert:"
+            gelb "  $gesperrt"
+            gelb "Freigeben mit:$(for h in $gesperrt; do printf ' --allow %s' "$h"; done)"
+            gelb "(oder ERLAUBTE_HOSTS in der Konfigurationsdatei)"
+        fi
+        if [ "$status" -ne 0 ] && { [ "$AUSFUEHRLICH" -eq 1 ] || grep -q ' ERROR ' "$PROXY_LOG"; }; then
+            gelb "--- Proxy-Protokoll (letzte Zeilen) ---"
+            grep -v 'ABGELEHNT' "$PROXY_LOG" | tail -n 15 >&2
+        fi
+    fi
+    rm -rf "$ARBEIT"
+    exit "$status"
+}
+trap aufraeumen EXIT INT TERM
+
+# --------------------------------------------------------------- Proxy starten
+freier_port() {
+    python3 - <<'PY'
+import socket
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+print(s.getsockname()[1])
+s.close()
+PY
+}
+
+LPORT=""
+if [ -n "$EXTERNER_PROXY" ]; then
+    PHOST="${EXTERNER_PROXY%:*}"; LPORT="${EXTERNER_PROXY##*:}"
+    [ "$PHOST" = "127.0.0.1" ] || [ "$PHOST" = "localhost" ] \
+        || fehler "--use-proxy muss auf 127.0.0.1 zeigen (der Tunnel endet lokal), nicht $PHOST"
+    info "Nutze vorhandenen Proxy auf 127.0.0.1:$LPORT"
+else
+    [ -r "$PROXY_SKRIPT" ] || fehler "Proxy-Skript nicht gefunden: $PROXY_SKRIPT"
+    command -v python3 >/dev/null || fehler "python3 wird auf dem Gateway benoetigt"
+    LPORT="$(freier_port)"
+    declare -a PARGS=(python3 "$PROXY_SKRIPT" --host 127.0.0.1 --port "$LPORT"
+                      --cache-max-mb "$CACHE_MAX_MB")
+    if [ -n "$CACHE_VERZ" ]; then PARGS+=(--cache "$CACHE_VERZ"); else PARGS+=(--cache ""); fi
+    for h in "${ERLAUBTE_HOSTS[@]:-}"; do [ -n "$h" ] && PARGS+=(--allow "$h"); done
+    [ "$PROXY_DEBUG" -eq 1 ] && PARGS+=(--debug)
+    laut "Proxy starten: ${PARGS[*]}"
+    "${PARGS[@]}" >"$PROXY_LOG" 2>&1 &
+    PROXY_PID=$!
+    # auf Bereitschaft warten
+    for _ in $(seq 1 50); do
+        if python3 -c "
+import socket,sys
+s=socket.socket(); s.settimeout(0.3)
+sys.exit(0 if s.connect_ex(('127.0.0.1',$LPORT))==0 else 1)
+" 2>/dev/null; then break; fi
+        kill -0 "$PROXY_PID" 2>/dev/null || { cat "$PROXY_LOG" >&2; fehler "Proxy ist nicht gestartet"; }
+        sleep 0.1
+    done
+    info "Proxy laeuft lokal auf 127.0.0.1:$LPORT"
+    [ -n "$CACHE_VERZ" ] && laut "Cache: $CACHE_VERZ"
+fi
+
+# ------------------------------------------------------- SSH-Master aufbauen
+info "Verbinde mit $ZIEL (Port $SSH_PORT) ..."
+if ! "${SSH_BASIS[@]}" -M -N -f -o ControlMaster=yes "$ZIEL" 2>"$ARBEIT/ssh.err"; then
+    cat "$ARBEIT/ssh.err" >&2
+    fehler "SSH-Verbindung zu $ZIEL fehlgeschlagen"
+fi
+MASTER_LAEUFT=1
+
+# Reverse-Tunnel mit dynamischem Remote-Port: ssh waehlt einen freien Port
+# auf dem Ziel und nennt ihn -- so gibt es keine Portkonflikte.
+if ! RPORT="$("${SSH_BASIS[@]}" -O forward -R "0:127.0.0.1:$LPORT" "$ZIEL" 2>"$ARBEIT/fwd.err")"; then
+    cat "$ARBEIT/fwd.err" >&2
+    rot "Der Reverse-Tunnel konnte nicht aufgebaut werden."
+    rot "Haeufigste Ursache: 'AllowTcpForwarding no' in der sshd_config des Ziels."
+    rot "Alternative ohne Port-Weiterleitung: bin/apt-offline-sync (siehe README)."
+    exit 1
+fi
+RPORT="$(printf '%s' "$RPORT" | tr -dc '0-9')"
+[ -n "$RPORT" ] || fehler "Konnte den zugewiesenen Remote-Port nicht ermitteln"
+info "Reverse-Tunnel steht: Ziel 127.0.0.1:$RPORT -> Gateway 127.0.0.1:$LPORT"
+
+ssh_aus() { "${SSH_BASIS[@]}" "$ZIEL" "$@"; }
+
+# ------------------------------------------------------------- Ziel pruefen
+ZIEL_BENUTZER="$(ssh_aus 'id -un' 2>/dev/null | tr -d '\r\n' || true)"
+[ -n "$ZIEL_BENUTZER" ] || fehler "Konnte auf dem Ziel keinen Befehl ausfuehren"
+laut "Angemeldet als: $ZIEL_BENUTZER"
+
+SUDO=""
+case "$SUDO_MODUS" in
+    ja)   SUDO="sudo -n " ;;
+    nein) SUDO="" ;;
+    auto) [ "$ZIEL_BENUTZER" = "root" ] || SUDO="sudo -n " ;;
+esac
+if [ -n "$SUDO" ]; then
+    ssh_aus 'sudo -n true' >/dev/null 2>&1 \
+        || fehler "sudo ohne Passwort ist fuer $ZIEL_BENUTZER nicht moeglich (NOPASSWD noetig) -- oder als root verbinden"
+    laut "Verwende sudo"
+fi
+
+# Erreichbarkeit des Proxys vom Ziel aus pruefen (vier Varianten, je nach
+# dem, was auf dem Minimalsystem vorhanden ist).
+pruefe_tunnel() {
+    local skript
+    skript=$(cat <<PRUEF
+p=$RPORT
+if command -v curl >/dev/null 2>&1; then
+    curl -fsS -m 10 "http://127.0.0.1:\$p/_health" && exit 0
+fi
+if command -v wget >/dev/null 2>&1; then
+    wget -qO- --timeout=10 "http://127.0.0.1:\$p/_health" && exit 0
+fi
+if command -v python3 >/dev/null 2>&1; then
+    python3 -c "import urllib.request,sys; sys.stdout.write(urllib.request.urlopen('http://127.0.0.1:\$p/_health',timeout=10).read().decode())" && exit 0
+fi
+if exec 3<>/dev/tcp/127.0.0.1/\$p 2>/dev/null; then
+    printf 'GET /_health HTTP/1.0\r\n\r\n' >&3
+    cat <&3 | tail -n 1
+    exit 0
+fi
+echo "keine Pruefmoeglichkeit gefunden" >&2
+exit 2
+PRUEF
+)
+    ssh_aus "bash -s" <<<"$skript" 2>&1
+}
+
+ANTWORT="$(pruefe_tunnel || true)"
+if printf '%s' "$ANTWORT" | grep -q "apt-via-ssh proxy ok"; then
+    gruen "Proxy ist vom Zielsystem aus erreichbar."
+elif [ -n "$EXTERNER_PROXY" ] && [ -n "$ANTWORT" ]; then
+    laut "Fremder Proxy antwortet (kein /_health): $ANTWORT"
+    gruen "Tunnel steht."
+else
+    rot "Der Proxy ist vom Zielsystem aus nicht erreichbar."
+    rot "Antwort war: ${ANTWORT:-<leer>}"
+    exit 1
+fi
+
+# ------------------------------------------------------------- apt ausfuehren
+PROXY_URL="http://127.0.0.1:$RPORT"
+declare -a APT_OPT=(
+    -o "Acquire::http::Proxy=$PROXY_URL"
+    -o "Acquire::https::Proxy=$PROXY_URL"
+)
+# -s/-d/-y gelten nur fuer die eigentliche Operation, nicht fuer 'update'
+OP_OPT=""
+[ "$TROCKEN" -eq 1 ]   && OP_OPT+=" -s"
+[ "$NUR_LADEN" -eq 1 ] && OP_OPT+=" -d"
+[ "$JA" -eq 1 ]        && OP_OPT+=" -y"
+
+# Zeichenkette fuer die Gegenseite bauen
+APT_OPT_STR=""
+for o in "${APT_OPT[@]}"; do APT_OPT_STR+=" $(sq "$o")"; done
+
+# Variablen per 'env' NACH sudo setzen -- sudo (env_reset) verwirft sie sonst.
+UMGEBUNG=""
+[ "$JA" -eq 1 ] && UMGEBUNG=" DEBIAN_FRONTEND=noninteractive"
+
+# Interaktives Terminal nur, wenn sinnvoll
+declare -a TTY_OPT=()
+if [ -t 0 ] && [ "$JA" -eq 0 ] && [ "$BEFEHL" != "selftest" ]; then TTY_OPT=(-tt); fi
+
+fuehr_aus() {   # fuehrt eine Befehlszeile auf dem Ziel aus
+    laut "remote: $1"
+    "${SSH_BASIS[@]}" "${TTY_OPT[@]}" "$ZIEL" "$1"
+}
+
+APT="${SUDO}env${UMGEBUNG} apt-get${APT_OPT_STR}"   # fuer update
+APT_OP="${APT}${OP_OPT}"                              # fuer die Operation
+
+case "$BEFEHL" in
+    selftest)
+        info "Selbsttest: hole nur die Paketlisten"
+        fuehr_aus "$APT -q update"
+        gruen "Selbsttest erfolgreich: Updates sind ueber den Tunnel moeglich."
+        ;;
+    update)
+        fuehr_aus "$APT update"
+        ;;
+    check)
+        fuehr_aus "$APT -q update"
+        info "Anstehende Updates:"
+        fuehr_aus "${SUDO}apt list --upgradable 2>/dev/null || ${SUDO}apt-get -s upgrade"
+        ;;
+    upgrade)
+        fuehr_aus "$APT update"
+        fuehr_aus "$APT_OP upgrade"
+        ;;
+    full-upgrade|dist-upgrade)
+        fuehr_aus "$APT update"
+        fuehr_aus "$APT_OP full-upgrade"
+        ;;
+    install)
+        PAKETE=""
+        for p in "${BEFEHL_ARGS[@]}"; do PAKETE+=" $(sq "$p")"; done
+        fuehr_aus "$APT update"
+        fuehr_aus "$APT_OP install$PAKETE"
+        ;;
+    download)
+        PAKETE=""
+        for p in "${BEFEHL_ARGS[@]}"; do PAKETE+=" $(sq "$p")"; done
+        fuehr_aus "$APT update"
+        fuehr_aus "$APT_OP -d install$PAKETE"
+        info "Die Pakete liegen auf dem Ziel in /var/cache/apt/archives."
+        ;;
+    run)
+        ZEILE=""
+        for a in "${BEFEHL_ARGS[@]}"; do ZEILE+=" $(sq "$a")"; done
+        fuehr_aus "${SUDO}env http_proxy=$(sq "$PROXY_URL") https_proxy=$(sq "$PROXY_URL") \
+HTTP_PROXY=$(sq "$PROXY_URL") HTTPS_PROXY=$(sq "$PROXY_URL") sh -c$ZEILE"
+        ;;
+    tunnel)
+        cat >&2 <<TXT
+
+Der Tunnel steht. Auf dem Zielsystem laesst sich apt jetzt so benutzen:
+
+  ${SUDO}apt-get -o Acquire::http::Proxy=$PROXY_URL \\
+          -o Acquire::https::Proxy=$PROXY_URL update
+
+Oder dauerhaft fuer die Sitzung:
+
+  export http_proxy=$PROXY_URL https_proxy=$PROXY_URL
+
+TXT
+        if [ "$HALTEZEIT" = "0" ]; then
+            info "Offen bis Strg-C ..."
+            while kill -0 "${PROXY_PID:-$$}" 2>/dev/null; do sleep 1; done
+        else
+            info "Offen fuer $HALTEZEIT Sekunden ..."
+            sleep "$HALTEZEIT"
+        fi
+        ;;
+esac
+
+gruen "Fertig."

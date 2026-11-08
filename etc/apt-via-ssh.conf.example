@@ -1,0 +1,23 @@
+# Beispielkonfiguration fuer apt-via-ssh
+# Kopieren nach ~/.config/apt-via-ssh.conf  (oder mit -c DATEI angeben)
+# Kommandozeilen-Optionen haben Vorrang vor dieser Datei.
+
+# SSH-Port des Zielsystems
+SSH_PORT=22
+
+# SSH-Schluessel (leer = Standard aus ~/.ssh bzw. ssh-agent)
+#SSH_IDENTITAET=~/.ssh/id_ed25519
+
+# Weitere erlaubte Repository-Hosts (Debian-Mirrors sind immer erlaubt).
+# Leerzeichen- oder kommagetrennt; Domain-Suffixe gelten fuer Subdomains.
+#ERLAUBTE_HOSTS="download.docker.com packages.microsoft.com"
+
+# Paket-Cache auf dem Gateway (leer = kein Cache)
+CACHE_VERZ=~/.cache/apt-via-ssh/pakete
+CACHE_MAX_MB=1024
+
+# Vorhandenen Proxy statt des mitgelieferten verwenden, z.B. apt-cacher-ng
+#EXTERNER_PROXY=127.0.0.1:3142
+
+# auto = sudo nur, wenn nicht als root angemeldet | ja | nein
+SUDO_MODUS=auto

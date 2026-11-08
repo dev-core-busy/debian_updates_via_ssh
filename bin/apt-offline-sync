@@ -1,0 +1,248 @@
+#!/usr/bin/env bash
+#
+# apt-offline-sync -- Debian-Updates fuer ein abgeschottetes System OHNE
+#                     SSH-Port-Weiterleitung (Fallback zu apt-via-ssh).
+#
+# Ablauf:
+#   1. Vom Ziel holen: Paketquellen, Keyrings, dpkg-Status, Architektur
+#   2. Auf dem Gateway: apt "stellvertretend fuer das Ziel" ausfuehren
+#      (eigenes Wurzelverzeichnis, kein root noetig) -> Paketlisten und
+#      genau die benoetigten .deb-Dateien werden heruntergeladen und von
+#      apt gegen die Keyrings DES ZIELS geprueft
+#   3. Listen + Pakete per tar ueber die SSH-Sitzung uebertragen
+#   4. Auf dem Ziel: apt-get --no-download upgrade/install
+#
+# Benoetigt nur: SSH-Befehlsausfuehrung. Kein -R/-L, kein SFTP, kein scp.
+# Gateway muss Debian/Ubuntu mit apt und gpgv sein.
+#
+set -euo pipefail
+
+VERSION="1.0"
+SELBST="${0##*/}"
+
+ZIEL=""; BEFEHL=""; declare -a PAKETE=()
+SSH_PORT="22"; SSH_IDENTITAET=""; declare -a SSH_EXTRA=()
+SUDO_MODUS="auto"; JA=0; TROCKEN=0; NUR_UEBERTRAGEN=0; AUSFUEHRLICH=0
+BEHALTEN=""   # Arbeitsverzeichnis auf dem Gateway behalten (Pfad)
+
+rot()  { [ -t 2 ] && printf '\033[31m%s\033[0m\n' "$*" >&2 || printf '%s\n' "$*" >&2; }
+gruen(){ [ -t 2 ] && printf '\033[32m%s\033[0m\n' "$*" >&2 || printf '%s\n' "$*" >&2; }
+info() { printf '[%s] %s\n' "$SELBST" "$*" >&2; }
+laut() { [ "$AUSFUEHRLICH" -eq 1 ] && printf '[%s] %s\n' "$SELBST" "$*" >&2 || true; }
+fehler(){ rot "FEHLER: $*"; exit 1; }
+sq() { local s=${1-}; printf "'%s'" "${s//\'/\'\\\'\'}"; }
+
+hilfe() {
+cat <<'TXT'
+apt-offline-sync -- Debian-Updates ohne Port-Weiterleitung, nur ueber SSH-Befehle
+
+AUFRUF
+  apt-offline-sync [OPTIONEN] ZIEL BEFEHL [PAKETE ...]
+
+BEFEHLE
+  check            anstehende Updates anzeigen (nichts wird uebertragen)
+  upgrade          apt-get upgrade
+  full-upgrade     apt-get full-upgrade
+  install PAKET... Pakete installieren
+
+OPTIONEN
+  -p, --ssh-port PORT     SSH-Port (Vorgabe: 22)
+  -i, --identity DATEI    SSH-Schluessel
+  -o, --ssh-option OPT    zusaetzliche ssh-Option, mehrfach moeglich
+      --sudo / --no-sudo  sudo -n auf dem Ziel erzwingen / abschalten
+  -y, --yes               ohne Rueckfrage installieren
+  -s, --dry-run           auf dem Ziel nur simulieren
+      --stage-only        nur uebertragen, nicht installieren
+      --keep DIR          Arbeitsverzeichnis des Gateways nach DIR kopieren
+  -v, --verbose           mehr Ausgabe
+  -h, --help              diese Hilfe
+
+HINWEISE
+  * Quellen mit file:/cdrom:-URIs werden nicht unterstuetzt.
+  * Einstellungen aus /etc/apt/apt.conf.d des Ziels werden nicht uebernommen
+    (preferences/Pinning dagegen schon).
+  * Die bisherigen Paketlisten des Ziels werden nach
+    /var/lib/apt/lists.vor-apt-offline-sync gesichert.
+TXT
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h|--help) hilfe; exit 0 ;;
+        -V|--version) echo "$SELBST $VERSION"; exit 0 ;;
+        -p|--ssh-port) SSH_PORT="${2:?}"; shift 2 ;;
+        -i|--identity) SSH_IDENTITAET="${2:?}"; shift 2 ;;
+        -o|--ssh-option) SSH_EXTRA+=(-o "${2:?}"); shift 2 ;;
+        --sudo) SUDO_MODUS="ja"; shift ;;
+        --no-sudo) SUDO_MODUS="nein"; shift ;;
+        -y|--yes) JA=1; shift ;;
+        -s|--dry-run) TROCKEN=1; shift ;;
+        --stage-only) NUR_UEBERTRAGEN=1; shift ;;
+        --keep) BEHALTEN="${2:?}"; shift 2 ;;
+        -v|--verbose) AUSFUEHRLICH=1; shift ;;
+        -*) fehler "Unbekannte Option: $1" ;;
+        *) if [ -z "$ZIEL" ]; then ZIEL="$1"
+           elif [ -z "$BEFEHL" ]; then BEFEHL="$1"
+           else PAKETE+=("$1"); fi; shift ;;
+    esac
+done
+[ -n "$ZIEL" ] && [ -n "$BEFEHL" ] || { hilfe; exit 1; }
+case "$BEFEHL" in
+    check|upgrade|full-upgrade|dist-upgrade|install) ;;
+    *) fehler "Unbekannter Befehl: $BEFEHL" ;;
+esac
+[ "$BEFEHL" = dist-upgrade ] && BEFEHL=full-upgrade
+[ "$BEFEHL" != install ] || [ ${#PAKETE[@]} -gt 0 ] || fehler "install braucht Paketnamen"
+
+command -v apt-get >/dev/null || fehler "apt-get fehlt auf dem Gateway"
+command -v gpgv >/dev/null    || fehler "gpgv fehlt auf dem Gateway (apt install gpgv)"
+
+ARBEIT="$(mktemp -d -t apt-offline-sync.XXXXXX)"
+R="$ARBEIT/wurzel"
+STEUERSOCKET="$ARBEIT/ssh.sock"
+MASTER=0
+
+declare -a SSH_BASIS=(ssh -p "$SSH_PORT" -o ControlPath="$STEUERSOCKET"
+                      -o ServerAliveInterval=30 -o ServerAliveCountMax=4)
+[ -n "$SSH_IDENTITAET" ] && SSH_BASIS+=(-i "$SSH_IDENTITAET")
+[ ${#SSH_EXTRA[@]} -gt 0 ] && SSH_BASIS+=("${SSH_EXTRA[@]}")
+ssh_aus() { "${SSH_BASIS[@]}" "$ZIEL" "$@"; }
+
+aufraeumen() {
+    local status=$?; set +e
+    [ "$MASTER" -eq 1 ] && "${SSH_BASIS[@]}" -O exit "$ZIEL" >/dev/null 2>&1
+    if [ -n "$BEHALTEN" ] && [ -d "$R" ]; then
+        mkdir -p "$BEHALTEN" && cp -a "$R/." "$BEHALTEN/" && info "Arbeitsverzeichnis kopiert nach $BEHALTEN"
+    fi
+    rm -rf "$ARBEIT"
+    exit "$status"
+}
+trap aufraeumen EXIT INT TERM
+
+# -------------------------------------------------------- 1. Ziel erfassen
+info "Verbinde mit $ZIEL ..."
+"${SSH_BASIS[@]}" -M -N -f -o ControlMaster=yes "$ZIEL" || fehler "SSH-Verbindung fehlgeschlagen"
+MASTER=1
+
+BENUTZER="$(ssh_aus 'id -un' | tr -d '\r\n')"
+SUDO=""
+case "$SUDO_MODUS" in
+    ja) SUDO="sudo -n " ;;
+    auto) [ "$BENUTZER" = root ] || SUDO="sudo -n " ;;
+esac
+if [ -n "$SUDO" ] && [ "$BEFEHL" != check ]; then
+    ssh_aus 'sudo -n true' >/dev/null 2>&1 || fehler "sudo ohne Passwort fuer $BENUTZER nicht moeglich"
+fi
+
+ARCH="$(ssh_aus 'dpkg --print-architecture' | tr -d '\r\n')"
+FREMD="$(ssh_aus 'dpkg --print-foreign-architectures' | tr '\r\n' '  ')"
+info "Ziel: Benutzer $BENUTZER, Architektur $ARCH${FREMD:+ (+ $FREMD)}"
+
+info "Hole Paketquellen, Keyrings und dpkg-Status ..."
+mkdir -p "$R"
+ssh_aus 'cd / && for f in etc/apt/sources.list etc/apt/sources.list.d etc/apt/trusted.gpg \
+    etc/apt/trusted.gpg.d etc/apt/preferences etc/apt/preferences.d etc/apt/keyrings \
+    usr/share/keyrings var/lib/dpkg/status var/lib/apt/extended_states etc/os-release; do
+        [ -e "$f" ] && printf "%s\n" "$f"; done | tar -cf - --ignore-failed-read -T - 2>/dev/null' \
+    | tar -C "$R" -xf - || fehler "Uebertragung der Konfiguration fehlgeschlagen"
+[ -s "$R/var/lib/dpkg/status" ] || fehler "dpkg-Status des Ziels fehlt"
+laut "Ziel-System: $(. "$R/etc/os-release" 2>/dev/null && echo "$PRETTY_NAME")"
+
+# Signed-By-Pfade auf die kopierten Keyrings umbiegen (inline-Schluessel bleiben unberuehrt)
+shopt -s nullglob
+for q in "$R/etc/apt/sources.list" "$R"/etc/apt/sources.list.d/*.list "$R"/etc/apt/sources.list.d/*.sources; do
+    [ -f "$q" ] || continue
+    sed -i -E "s#(signed-by=|Signed-By:[[:space:]]*)/#\1$R/#gI" "$q"
+    if grep -qiE '^[^#]*(file:|cdrom:)' "$q"; then
+        rot "Hinweis: $(basename "$q") enthaelt file:/cdrom:-Quellen -- diese werden ignoriert."
+    fi
+done
+shopt -u nullglob
+
+mkdir -p "$R/etc/apt/apt.conf.d" "$R/var/lib/apt/lists/partial" \
+         "$R/var/cache/apt/archives/partial" "$R/var/log/apt"
+[ -f "$R/var/lib/apt/extended_states" ] || : > "$R/var/lib/apt/extended_states"
+
+{
+    echo "Dir \"$R/\";"
+    echo "Dir::State::status \"$R/var/lib/dpkg/status\";"
+    echo "Dir::Etc::parts \"apt.conf.d\";"   # relativ zu Dir::Etc
+    echo "APT::Architecture \"$ARCH\";"
+    printf 'APT::Architectures { "%s";' "$ARCH"
+    for a in $FREMD; do printf ' "%s";' "$a"; done
+    echo ' };'
+    echo 'Debug::NoLocking "true";'
+    echo 'Acquire::GzipIndexes "false";'
+    echo 'Acquire::Languages "none";'
+    echo 'APT::Sandbox::User "";'
+    echo 'Dpkg::Use-Pty "false";'
+} > "$ARBEIT/apt.conf"
+export APT_CONFIG="$ARBEIT/apt.conf"
+
+# ----------------------------------------- 2. stellvertretend auf dem Gateway
+info "Lade Paketlisten (geprueft mit den Keyrings des Ziels) ..."
+apt-get -q update 2>&1 | sed 's/^/    /' >&2
+[ "${PIPESTATUS[0]}" -eq 0 ] || fehler "apt-get update auf dem Gateway fehlgeschlagen"
+
+case "$BEFEHL" in
+    check)
+        info "Anstehende Updates fuer $ZIEL:"
+        apt-get -s -q full-upgrade 2>/dev/null | awk '
+            /^Inst /{ alt=$3; neu=$4; gsub(/[][()]/,"",alt); gsub(/[][()]/,"",neu)
+                      if (alt ~ /^[0-9]/) printf "  %-32s %s -> %s\n", $2, alt, neu
+                      else { neu=$3; gsub(/[()]/,"",neu); printf "  %-32s (neu) %s\n", $2, neu }
+                      n++ }
+            END { if (!n) print "  keine -- das System ist aktuell"; else printf "  %d Paket(e)\n", n }'
+        exit 0 ;;
+    install) declare -a OP=(install "${PAKETE[@]}") ;;
+    *)       declare -a OP=("$BEFEHL") ;;
+esac
+
+info "Ermittle und lade benoetigte Pakete ..."
+apt-get -q -y -d "${OP[@]}" 2>&1 | sed 's/^/    /' >&2
+[ "${PIPESTATUS[0]}" -eq 0 ] || fehler "Herunterladen fehlgeschlagen"
+
+ANZAHL=$(find "$R/var/cache/apt/archives" -maxdepth 1 -name '*.deb' | wc -l)
+GROESSE=$(du -sk "$R/var/cache/apt/archives" | cut -f1)
+info "$ANZAHL Paket(e), $((GROESSE/1024)) MiB inklusive Listen werden uebertragen"
+
+# --------------------------------------------------------- 3. uebertragen
+FREI=$(ssh_aus 'df -Pk /var/tmp | awk "NR==2{print \$4}"' | tr -d '\r\n')
+LISTEN_KB=$(du -sk "$R/var/lib/apt/lists" | cut -f1)
+BEDARF=$(( (GROESSE + LISTEN_KB) * 2 + 51200 ))
+[ "${FREI:-0}" -gt "$BEDARF" ] || fehler "Zu wenig Platz auf dem Ziel in /var/tmp (frei ${FREI:-?} KiB, noetig ~$BEDARF KiB)"
+
+info "Uebertrage per SSH ..."
+STAGING="$(tar -C "$R/var" -cf - --exclude='partial' --exclude='lock' \
+              lib/apt/lists cache/apt/archives \
+          | ssh_aus 'd=$(mktemp -d /var/tmp/apt-offline-sync.XXXXXX) && tar -C "$d" -xf - && echo "$d"' \
+          | tr -d '\r\n')"
+case "$STAGING" in /var/tmp/apt-offline-sync.*) ;; *) fehler "Uebertragung fehlgeschlagen" ;; esac
+laut "Staging auf dem Ziel: $STAGING"
+
+info "Spiele Listen und Pakete auf dem Ziel ein ..."
+ssh_aus "${SUDO}sh -c $(sq "set -e
+d=$STAGING
+rm -rf /var/lib/apt/lists.vor-apt-offline-sync
+cp -a /var/lib/apt/lists /var/lib/apt/lists.vor-apt-offline-sync
+find /var/lib/apt/lists -maxdepth 1 -type f ! -name lock -delete
+cp --preserve=timestamps \"\$d\"/lib/apt/lists/* /var/lib/apt/lists/ 2>/dev/null || true
+for f in \"\$d\"/cache/apt/archives/*.deb; do [ -e \"\$f\" ] && cp \"\$f\" /var/cache/apt/archives/; done
+rm -rf \"\$d\"")" || fehler "Einspielen fehlgeschlagen"
+
+if [ "$NUR_UEBERTRAGEN" -eq 1 ]; then
+    gruen "Uebertragen. Installation auf dem Ziel spaeter mit:"
+    echo "  ${SUDO}apt-get --no-download ${OP[*]}"
+    exit 0
+fi
+
+# ------------------------------------------------------------ 4. installieren
+# env NACH sudo, sonst verwirft sudo die Variable
+if [ "$JA" -eq 1 ]; then ZEILE="${SUDO}env DEBIAN_FRONTEND=noninteractive apt-get --no-download -y"
+else ZEILE="${SUDO}apt-get --no-download"; fi
+[ "$TROCKEN" -eq 1 ] && ZEILE="$ZEILE -s"
+for o in "${OP[@]}"; do ZEILE+=" $(sq "$o")"; done
+declare -a TTY=(); [ -t 0 ] && [ "$JA" -eq 0 ] && TTY=(-tt)
+info "Auf dem Ziel: $ZEILE"
+"${SSH_BASIS[@]}" "${TTY[@]}" "$ZIEL" "$ZEILE"
+gruen "Fertig."
