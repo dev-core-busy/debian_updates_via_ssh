@@ -24,6 +24,7 @@ Proxy wieder weg.
 
 | Datei | Zweck |
 |---|---|
+| `start.sh` | **Startskript der Oberfläche** im Projektverzeichnis (prüft Python und OpenSSH, funktioniert auch über einen Symlink) |
 | `bin/apt-via-ssh-gui` | **Oberfläche im Browser**: Ziel anmelden, Voraussetzungen einrichten, Updates mit Vorschau, Distributions-Upgrade |
 | `bin/apt-via-ssh` | **Kommandozeile**: Proxy starten, Reverse-Tunnel aufbauen, apt auf dem Ziel ausführen, aufräumen |
 | `gateway/apt_proxy.py` | HTTP-Proxy (nur Python-Standardbibliothek): Host-Whitelist, CONNECT für https, Cache für `.deb`-Dateien |
@@ -37,7 +38,14 @@ Proxy wieder weg.
 ## Oberfläche
 
 ```bash
-bin/apt-via-ssh-gui
+./start.sh
+```
+
+Optionen: `--kein-browser` (nur den Link ausgeben), `--port 9000` (Vorgabe 8765;
+ist der Port belegt, wird ein freier gewählt). Für einen Aufruf von überall:
+
+```bash
+ln -s "$PWD/start.sh" ~/bin/apt-via-ssh-gui
 ```
 
 Das Skript startet einen kleinen Webserver **nur auf 127.0.0.1** und öffnet den Browser.
