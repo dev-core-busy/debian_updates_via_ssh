@@ -274,3 +274,8 @@ python3 tests/gui-test.py              # ca. 5–10 Minuten
 ```bash
 python3 tests/gui-test.py --ohne-dist  # schneller, ohne Distributions-Upgrade
 ```
+
+## Lizenz
+
+MIT – siehe [LICENSE](LICENSE). Die Software wird ohne Gewähr bereitgestellt:
+Vor dem Einsatz auf produktiven Systemen bitte ein Backup bzw. einen Snapshot anlegen.
